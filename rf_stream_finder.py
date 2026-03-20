@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import array
 import math
+import os
 import queue
 import random
 import shutil
 import statistics
 import subprocess
+import tempfile
 import threading
 import time
+import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +19,11 @@ from typing import Callable, Iterable, Optional
 
 import tkinter as tk
 from tkinter import messagebox, ttk
+
+try:
+    import winsound
+except ImportError:
+    winsound = None
 
 
 @dataclass(slots=True)
@@ -48,6 +57,29 @@ class SpectrumSnapshot:
     candidates: list[SignalCandidate]
     sweep_count: int
     source: str
+
+
+@dataclass(slots=True)
+class LoggedSignal:
+    first_seen: str
+    last_seen: str
+    center_hz: float
+    bandwidth_hz: float
+    peak_db: float
+    label: str
+    score: float
+    hit_count: int
+
+
+@dataclass(slots=True)
+class InvestigationResult:
+    center_hz: float
+    bandwidth_hz: float
+    demod_mode: str
+    audio_path: Optional[str]
+    iq_path: Optional[str]
+    summary: str
+    recommended_next_step: str
 
 
 class SweepParser:
@@ -357,6 +389,248 @@ class HackRFSweepWorker:
         return None
 
 
+class SignalHistory:
+    def __init__(self, merge_hz: float = 150_000.0) -> None:
+        self.merge_hz = merge_hz
+        self.entries: list[LoggedSignal] = []
+
+    def update(self, timestamp: str, candidates: Iterable[SignalCandidate]) -> list[LoggedSignal]:
+        updated: list[LoggedSignal] = []
+        for candidate in candidates:
+            existing = self._match(candidate)
+            if existing:
+                existing.last_seen = timestamp
+                existing.center_hz = (existing.center_hz * existing.hit_count + candidate.center_hz) / (existing.hit_count + 1)
+                existing.bandwidth_hz = max(existing.bandwidth_hz, candidate.bandwidth_hz)
+                existing.peak_db = max(existing.peak_db, candidate.peak_db)
+                existing.score = max(existing.score, candidate.score)
+                existing.label = candidate.label
+                existing.hit_count += 1
+                updated.append(existing)
+            else:
+                entry = LoggedSignal(
+                    first_seen=timestamp,
+                    last_seen=timestamp,
+                    center_hz=candidate.center_hz,
+                    bandwidth_hz=candidate.bandwidth_hz,
+                    peak_db=candidate.peak_db,
+                    label=candidate.label,
+                    score=candidate.score,
+                    hit_count=1,
+                )
+                self.entries.append(entry)
+                updated.append(entry)
+        self.entries.sort(key=lambda item: (item.hit_count, item.score, item.peak_db), reverse=True)
+        return updated
+
+    def _match(self, candidate: SignalCandidate) -> Optional[LoggedSignal]:
+        for entry in self.entries:
+            if abs(entry.center_hz - candidate.center_hz) <= max(self.merge_hz, candidate.bandwidth_hz):
+                return entry
+        return None
+
+
+class SignalAnalyzer:
+    def __init__(self, status_callback: Callable[[str], None]) -> None:
+        self.status_callback = status_callback
+        self.last_audio_path: Optional[str] = None
+
+    def analyze_candidate(self, candidate: SignalCandidate, config: dict) -> InvestigationResult:
+        mode = self._choose_mode(candidate)
+        self.status_callback(f"Analyzing {candidate.center_hz / 1_000_000:.3f} MHz as {mode}.")
+        if config["source_mode"] == "simulation":
+            iq_path = self._write_simulated_iq(candidate)
+        else:
+            iq_path = self._capture_hardware_iq(candidate, config)
+
+        if mode == "DIGITAL":
+            summary = (
+                f"Best-effort classifier marked this signal as digital/unhandled. IQ capture saved for later analysis.\n"
+                f"Center: {candidate.center_hz / 1_000_000:.3f} MHz\n"
+                f"Bandwidth: {candidate.bandwidth_hz / 1_000:.1f} kHz\n"
+                f"Peak: {candidate.peak_db:.1f} dB\n"
+                f"IQ file: {iq_path}"
+            )
+            return InvestigationResult(
+                center_hz=candidate.center_hz,
+                bandwidth_hz=candidate.bandwidth_hz,
+                demod_mode=mode,
+                audio_path=None,
+                iq_path=iq_path,
+                summary=summary,
+                recommended_next_step="Inspect the IQ clip with protocol-specific tools or compare with known digital allocations.",
+            )
+
+        iq_samples, sample_rate = self._read_iq_file(iq_path)
+        audio_samples = self._demodulate(iq_samples, sample_rate, mode)
+        audio_path = self._write_wav(audio_samples, 48_000, candidate.center_hz, mode)
+        self.last_audio_path = audio_path
+        summary = (
+            f"Demodulated {mode} audio preview.\n"
+            f"Center: {candidate.center_hz / 1_000_000:.3f} MHz\n"
+            f"Bandwidth: {candidate.bandwidth_hz / 1_000:.1f} kHz\n"
+            f"Peak: {candidate.peak_db:.1f} dB\n"
+            f"Audio: {audio_path}\n"
+            f"IQ: {iq_path}"
+        )
+        return InvestigationResult(
+            center_hz=candidate.center_hz,
+            bandwidth_hz=candidate.bandwidth_hz,
+            demod_mode=mode,
+            audio_path=audio_path,
+            iq_path=iq_path,
+            summary=summary,
+            recommended_next_step="Listen for intelligible content, then refine bandwidth/gain or move to protocol-specific decoding if needed.",
+        )
+
+    def play_audio(self, path: Optional[str]) -> bool:
+        if not path or not Path(path).exists() or winsound is None:
+            return False
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        return True
+
+    @staticmethod
+    def _choose_mode(candidate: SignalCandidate) -> str:
+        if candidate.label == "Likely digital stream":
+            return "DIGITAL"
+        if candidate.bandwidth_hz >= 140_000:
+            return "WFM"
+        if candidate.bandwidth_hz >= 20_000:
+            return "NFM"
+        return "AM"
+
+    def _capture_hardware_iq(self, candidate: SignalCandidate, config: dict) -> str:
+        executable = self._find_hackrf_transfer()
+        if not executable:
+            raise RuntimeError("hackrf_transfer was not found.")
+        sample_rate = 2_000_000
+        duration_s = 1.5
+        samples = int(sample_rate * duration_s)
+        iq_path = str(Path(tempfile.gettempdir()) / f"rf_capture_{int(candidate.center_hz)}_{int(time.time())}.iq")
+        command = [
+            executable,
+            "-f",
+            str(int(candidate.center_hz)),
+            "-s",
+            str(sample_rate),
+            "-n",
+            str(samples),
+            "-l",
+            str(config["lna_gain"]),
+            "-g",
+            str(config["vga_gain"]),
+            "-r",
+            iq_path,
+        ]
+        if config["amp_enable"]:
+            command.extend(["-a", "1"])
+        if config["antenna_enable"]:
+            command.extend(["-p", "1"])
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        if completed.returncode != 0:
+            raise RuntimeError((completed.stderr or completed.stdout or "hackrf_transfer failed").strip())
+        return iq_path
+
+    def _write_simulated_iq(self, candidate: SignalCandidate) -> str:
+        sample_rate = 2_000_000
+        duration_s = 1.0
+        total = int(sample_rate * duration_s)
+        audio_freq = 1000.0
+        path = str(Path(tempfile.gettempdir()) / f"rf_sim_{int(candidate.center_hz)}_{int(time.time())}.iq")
+        raw = array.array("b")
+        mode = self._choose_mode(candidate)
+        phase = 0.0
+        for idx in range(total):
+            t = idx / sample_rate
+            if mode in {"WFM", "NFM"}:
+                deviation = 60_000 if mode == "WFM" else 5_000
+                phase += 2 * math.pi * deviation * math.sin(2 * math.pi * audio_freq * t) / sample_rate
+                i = int(max(-127, min(127, math.cos(phase) * 100)))
+                q = int(max(-127, min(127, math.sin(phase) * 100)))
+            else:
+                envelope = 0.55 + 0.35 * math.sin(2 * math.pi * audio_freq * t)
+                i = int(max(-127, min(127, envelope * 110 * math.cos(2 * math.pi * 8_000 * t))))
+                q = int(max(-127, min(127, envelope * 110 * math.sin(2 * math.pi * 8_000 * t))))
+            raw.extend([i, q])
+        with open(path, "wb") as handle:
+            raw.tofile(handle)
+        return path
+
+    @staticmethod
+    def _read_iq_file(path: str, sample_rate: int = 2_000_000) -> tuple[list[complex], int]:
+        raw = array.array("b")
+        with open(path, "rb") as handle:
+            raw.frombytes(handle.read())
+        iq_samples: list[complex] = []
+        for idx in range(0, len(raw) - 1, 2):
+            iq_samples.append(complex(raw[idx] / 128.0, raw[idx + 1] / 128.0))
+        return iq_samples, sample_rate
+
+    def _demodulate(self, iq_samples: list[complex], sample_rate: int, mode: str) -> list[int]:
+        if mode in {"WFM", "NFM"}:
+            baseband = self._fm_demod(iq_samples)
+        else:
+            baseband = self._am_demod(iq_samples)
+        filtered = self._remove_dc(baseband)
+        return self._resample_audio(filtered, sample_rate, 48_000)
+
+    @staticmethod
+    def _fm_demod(iq_samples: list[complex]) -> list[float]:
+        if len(iq_samples) < 2:
+            return []
+        output: list[float] = []
+        previous = iq_samples[0]
+        for sample in iq_samples[1:]:
+            product = sample * previous.conjugate()
+            output.append(math.atan2(product.imag, product.real))
+            previous = sample
+        return output
+
+    @staticmethod
+    def _am_demod(iq_samples: list[complex]) -> list[float]:
+        return [abs(sample) for sample in iq_samples]
+
+    @staticmethod
+    def _remove_dc(values: list[float]) -> list[float]:
+        if not values:
+            return []
+        mean = statistics.fmean(values)
+        return [value - mean for value in values]
+
+    @staticmethod
+    def _resample_audio(values: list[float], source_rate: int, target_rate: int) -> list[int]:
+        if not values:
+            return []
+        step = max(1, int(source_rate / target_rate))
+        reduced = [statistics.fmean(values[idx : idx + step]) for idx in range(0, len(values), step)]
+        peak = max((abs(value) for value in reduced), default=1.0) or 1.0
+        scale = 28000 / peak
+        return [int(max(-32767, min(32767, value * scale))) for value in reduced]
+
+    @staticmethod
+    def _write_wav(samples: list[int], sample_rate: int, center_hz: float, mode: str) -> str:
+        path = str(Path(tempfile.gettempdir()) / f"rf_audio_{mode.lower()}_{int(center_hz)}_{int(time.time())}.wav")
+        with wave.open(path, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(sample_rate)
+            pcm = array.array("h", samples)
+            handle.writeframes(pcm.tobytes())
+        return path
+
+    @staticmethod
+    def _find_hackrf_transfer() -> Optional[str]:
+        candidates = [
+            shutil.which("hackrf_transfer"),
+            str(Path.home() / "radioconda" / "Library" / "bin" / "hackrf_transfer.exe"),
+            str(Path.home() / "miniconda3" / "Library" / "bin" / "hackrf_transfer.exe"),
+        ]
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return candidate
+        return None
+
+
 class SpectrumCanvas(tk.Canvas):
     def __init__(self, master: tk.Misc, **kwargs) -> None:
         super().__init__(master, background="#07111b", highlightthickness=0, **kwargs)
@@ -459,12 +733,16 @@ class RFStreamFinderApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("RF Stream Finder")
-        self.root.geometry("1380x820")
+        self.root.geometry("1440x940")
         self.root.configure(background="#09131e")
 
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: Optional[HackRFSweepWorker] = None
         self.current_snapshot: Optional[SpectrumSnapshot] = None
+        self.signal_history = SignalHistory()
+        self.analyzer = SignalAnalyzer(self._queue_status)
+        self.history_entries: list[LoggedSignal] = []
+        self.last_analysis: Optional[InvestigationResult] = None
 
         self.source_mode = tk.StringVar(value="simulation")
         self.start_mhz_var = tk.StringVar(value="430")
@@ -478,6 +756,7 @@ class RFStreamFinderApp:
         self.strongest_var = tk.StringVar(value="No sweep yet")
         self.sweep_count_var = tk.StringVar(value="0")
         self.last_update_var = tk.StringVar(value="Never")
+        self.analysis_var = tk.StringVar(value="No stream analyzed yet")
 
         self._build_ui()
         self.root.after(100, self._pump_events)
@@ -498,6 +777,7 @@ class RFStreamFinderApp:
         container.columnconfigure(0, weight=3)
         container.columnconfigure(1, weight=1)
         container.rowconfigure(1, weight=1)
+        container.rowconfigure(2, weight=1)
 
         control = ttk.Frame(container, style="Panel.TFrame", padding=14)
         control.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 14))
@@ -532,7 +812,6 @@ class RFStreamFinderApp:
         sidebar = ttk.Frame(container, style="Panel.TFrame", padding=12)
         sidebar.grid(row=1, column=1, sticky="nsew")
         sidebar.rowconfigure(2, weight=1)
-        sidebar.rowconfigure(4, weight=1)
         sidebar.columnconfigure(0, weight=1)
 
         ttk.Label(sidebar, text="Status", style="Header.TLabel").grid(row=0, column=0, sticky="w")
@@ -543,6 +822,7 @@ class RFStreamFinderApp:
         self._add_status_row(status_frame, 1, "Sweeps", self.sweep_count_var)
         self._add_status_row(status_frame, 2, "Updated", self.last_update_var)
         self._add_status_row(status_frame, 3, "Strongest", self.strongest_var)
+        self._add_status_row(status_frame, 4, "Analysis", self.analysis_var)
 
         ttk.Label(sidebar, text="Detected Streams", style="Header.TLabel").grid(row=2, column=0, sticky="nw")
         self.candidate_tree = ttk.Treeview(sidebar, columns=("center", "bandwidth", "peak", "score"), show="headings", height=10)
@@ -552,9 +832,51 @@ class RFStreamFinderApp:
         self.candidate_tree.grid(row=3, column=0, sticky="nsew", pady=(8, 14))
         self.candidate_tree.bind("<<TreeviewSelect>>", self._on_candidate_select)
 
-        ttk.Label(sidebar, text="Event Log", style="Header.TLabel").grid(row=4, column=0, sticky="nw")
-        self.log_text = tk.Text(sidebar, height=10, background="#081520", foreground="#e3f2fd", insertbackground="#e3f2fd", relief="flat", wrap="word", font=("Consolas", 10))
-        self.log_text.grid(row=5, column=0, sticky="nsew", pady=(8, 0))
+        action_bar = ttk.Frame(sidebar, style="Panel.TFrame")
+        action_bar.grid(row=4, column=0, sticky="ew")
+        action_bar.columnconfigure(0, weight=1)
+        action_bar.columnconfigure(1, weight=1)
+        ttk.Button(action_bar, text="Analyze Selected", style="Accent.TButton", command=self.analyze_selected_stream).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(action_bar, text="Play Last Audio", command=self.play_last_audio).grid(row=0, column=1, sticky="ew")
+
+        notebook = ttk.Notebook(container)
+        notebook.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(14, 0))
+
+        history_tab = ttk.Frame(notebook, style="Panel.TFrame", padding=12)
+        investigation_tab = ttk.Frame(notebook, style="Panel.TFrame", padding=12)
+        log_tab = ttk.Frame(notebook, style="Panel.TFrame", padding=12)
+        notebook.add(history_tab, text="Found Signals")
+        notebook.add(investigation_tab, text="Investigation")
+        notebook.add(log_tab, text="Event Log")
+
+        history_tab.rowconfigure(1, weight=1)
+        history_tab.columnconfigure(0, weight=1)
+        ttk.Label(history_tab, text="Persistent Signal Log", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+        self.history_tree = ttk.Treeview(history_tab, columns=("first", "last", "center", "hits", "label", "peak"), show="headings", height=8)
+        for name, label, width in (
+            ("first", "First Seen", 150),
+            ("last", "Last Seen", 150),
+            ("center", "Center", 120),
+            ("hits", "Hits", 60),
+            ("label", "Type", 180),
+            ("peak", "Peak", 80),
+        ):
+            self.history_tree.heading(name, text=label)
+            self.history_tree.column(name, width=width, anchor="center")
+        self.history_tree.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+
+        investigation_tab.rowconfigure(1, weight=1)
+        investigation_tab.columnconfigure(0, weight=1)
+        ttk.Label(investigation_tab, text="Stream Investigation", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+        self.investigation_text = tk.Text(investigation_tab, height=12, background="#081520", foreground="#e3f2fd", insertbackground="#e3f2fd", relief="flat", wrap="word", font=("Consolas", 10))
+        self.investigation_text.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        self.investigation_text.configure(state="disabled")
+
+        log_tab.rowconfigure(1, weight=1)
+        log_tab.columnconfigure(0, weight=1)
+        ttk.Label(log_tab, text="Continuous Event Log", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+        self.log_text = tk.Text(log_tab, height=10, background="#081520", foreground="#e3f2fd", insertbackground="#e3f2fd", relief="flat", wrap="word", font=("Consolas", 10))
+        self.log_text.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
         self.log_text.configure(state="disabled")
 
     def _add_status_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar) -> None:
@@ -619,6 +941,8 @@ class RFStreamFinderApp:
                     self._handle_snapshot(payload)  # type: ignore[arg-type]
                 elif event_type == "status":
                     self._handle_status(str(payload))
+                elif event_type == "analysis":
+                    self._handle_analysis(payload)  # type: ignore[arg-type]
         except queue.Empty:
             pass
         finally:
@@ -636,12 +960,40 @@ class RFStreamFinderApp:
             self.strongest_var.set("No candidate streams")
         self.canvas.set_snapshot(snapshot)
         self._refresh_candidates(snapshot.candidates)
+        updated_entries = self.signal_history.update(snapshot.timestamp, snapshot.candidates)
+        if updated_entries:
+            self._refresh_history()
+            if any(entry.hit_count == 1 for entry in updated_entries):
+                newest = updated_entries[0]
+                self._log(
+                    f"Logged signal {newest.center_hz / 1_000_000:.3f} MHz"
+                    f" ({newest.label}, {newest.peak_db:.1f} dB)."
+                )
 
     def _handle_status(self, status: str) -> None:
         self.status_var.set(status)
         self._log(status)
         if "stopped" in status.lower() or "not found" in status.lower():
             self.worker = None
+
+    def _handle_analysis(self, result: InvestigationResult) -> None:
+        self.last_analysis = result
+        self.analysis_var.set(result.demod_mode)
+        self._set_text(
+            self.investigation_text,
+            result.summary + "\n\nRecommended next step:\n" + result.recommended_next_step,
+        )
+        if result.audio_path:
+            played = self.analyzer.play_audio(result.audio_path)
+            self._log(
+                f"Analysis complete for {result.center_hz / 1_000_000:.3f} MHz"
+                f" using {result.demod_mode}. Audio {'started' if played else 'saved'}."
+            )
+        else:
+            self._log(
+                f"Analysis complete for {result.center_hz / 1_000_000:.3f} MHz"
+                f" using {result.demod_mode}. No audio preview available."
+            )
 
     def _refresh_candidates(self, candidates: Iterable[SignalCandidate]) -> None:
         self.candidate_tree.delete(*self.candidate_tree.get_children())
@@ -658,9 +1010,63 @@ class RFStreamFinderApp:
                 ),
             )
 
+    def _refresh_history(self) -> None:
+        self.history_tree.delete(*self.history_tree.get_children())
+        self.history_entries = list(self.signal_history.entries)
+        for index, entry in enumerate(self.history_entries[:200]):
+            self.history_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    entry.first_seen,
+                    entry.last_seen,
+                    f"{entry.center_hz / 1_000_000:.3f} MHz",
+                    entry.hit_count,
+                    entry.label,
+                    f"{entry.peak_db:.1f} dB",
+                ),
+            )
+
     def _on_candidate_select(self, _event: object) -> None:
         selected = self.candidate_tree.selection()
         self.canvas.set_highlight(int(selected[0]) if selected else None)
+
+    def analyze_selected_stream(self) -> None:
+        if not self.current_snapshot:
+            messagebox.showinfo("No Spectrum", "Run a scan and select a stream first.")
+            return
+        selected = self.candidate_tree.selection()
+        if not selected:
+            messagebox.showinfo("No Selection", "Select a detected stream to investigate.")
+            return
+        candidate = self.current_snapshot.candidates[int(selected[0])]
+        if self.worker:
+            self._log("Pausing live scan for stream investigation.")
+            self.stop_scan()
+        self.analysis_var.set("Capturing")
+        self._set_text(
+            self.investigation_text,
+            f"Capturing IQ around {candidate.center_hz / 1_000_000:.3f} MHz for analysis...",
+        )
+        threading.Thread(target=self._analyze_candidate_thread, args=(candidate,), daemon=True).start()
+
+    def _analyze_candidate_thread(self, candidate: SignalCandidate) -> None:
+        try:
+            config = self._current_config()
+            result = self.analyzer.analyze_candidate(candidate, config)
+            self.event_queue.put(("analysis", result))
+        except Exception as exc:  # noqa: BLE001
+            self._queue_status(f"Analysis failed: {exc}")
+
+    def play_last_audio(self) -> None:
+        if not self.last_analysis or not self.last_analysis.audio_path:
+            messagebox.showinfo("No Audio", "Analyze a stream first to generate audio output.")
+            return
+        if not self.analyzer.play_audio(self.last_analysis.audio_path):
+            messagebox.showerror("Playback Failed", "The last audio file is unavailable for playback.")
+            return
+        self._log(f"Replaying audio from {self.last_analysis.audio_path}")
 
     def _log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -669,9 +1075,28 @@ class RFStreamFinderApp:
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
+    @staticmethod
+    def _set_text(widget: tk.Text, message: str) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", message)
+        widget.configure(state="disabled")
+
     def _on_close(self) -> None:
         self.stop_scan()
         self.root.after(200, self.root.destroy)
+
+    def _current_config(self) -> dict:
+        return {
+            "source_mode": self.source_mode.get(),
+            "start_mhz": int(float(self.start_mhz_var.get())),
+            "stop_mhz": int(float(self.stop_mhz_var.get())),
+            "bin_width_hz": int(float(self.bin_width_var.get())),
+            "lna_gain": int(float(self.lna_var.get())),
+            "vga_gain": int(float(self.vga_var.get())),
+            "amp_enable": self.amp_var.get(),
+            "antenna_enable": self.antenna_var.get(),
+        }
 
     @staticmethod
     def _human_bandwidth(bandwidth_hz: float) -> str:

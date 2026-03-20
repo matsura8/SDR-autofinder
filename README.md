@@ -7,6 +7,8 @@ Desktop spectrum scanner for HackRF that watches sweep output in real time, flag
 - Launches `hackrf_sweep` and parses live CSV sweep rows from the official HackRF sweep format.
 - Scores contiguous above-noise regions to identify likely digital streams, narrowband carriers, and other notable activity.
 - Draws a live spectrum view with highlighted candidate regions and a side panel listing center frequency, bandwidth, peak level, and confidence.
+- Maintains a persistent "found signals" log so repeated hits stay visible for later investigation.
+- Adds per-stream investigation that captures a short IQ clip around a selected signal, generates best-effort AM/FM audio output when appropriate, and stores the IQ/audio files on disk.
 - Includes a simulation mode so the GUI can be tested without a HackRF attached.
 
 ## Requirements
@@ -32,4 +34,5 @@ python -m unittest -v
 ## Notes
 
 - The detector is heuristic. It identifies spectrum regions that look like structured data activity, but it does not demodulate or decode traffic.
+- Stream investigation does best-effort automatic demodulation for analog-like signals and saves IQ clips for digital/unhandled signals. Protocol-specific digital decoding is intentionally left to external tools.
 - HackRF sweep bin widths must stay within HackRF's supported range. The GUI validates the minimum width before starting a scan.

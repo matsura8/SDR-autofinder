@@ -1,6 +1,6 @@
 import unittest
 
-from rf_stream_finder import SignalDetector, SweepAssembler, SweepParser
+from rf_stream_finder import SignalAnalyzer, SignalCandidate, SignalDetector, SignalHistory, SweepAssembler, SweepParser
 
 
 class SweepParserTests(unittest.TestCase):
@@ -43,6 +43,28 @@ class SignalDetectorTests(unittest.TestCase):
         self.assertTrue(candidates)
         self.assertEqual(candidates[0].label, "Likely digital stream")
         self.assertGreater(candidates[0].score, 0.5)
+
+
+class SignalHistoryTests(unittest.TestCase):
+    def test_merges_repeat_hits_near_same_frequency(self) -> None:
+        history = SignalHistory(merge_hz=100_000)
+        first = SignalCandidate(100.0, 140.0, 120.0, 40.0, -30.0, -35.0, 15.0, 0.7, "Wideband activity")
+        second = SignalCandidate(110.0, 150.0, 125.0, 40.0, -28.0, -33.0, 16.0, 0.8, "Wideband activity")
+        history.update("2026-03-19 18:00:00.0", [first])
+        history.update("2026-03-19 18:00:02.0", [second])
+        self.assertEqual(len(history.entries), 1)
+        self.assertEqual(history.entries[0].hit_count, 2)
+        self.assertEqual(history.entries[0].last_seen, "2026-03-19 18:00:02.0")
+
+
+class SignalAnalyzerTests(unittest.TestCase):
+    def test_choose_mode_prefers_digital_for_digital_candidates(self) -> None:
+        candidate = SignalCandidate(0, 0, 915_000_000, 300_000, -40.0, -45.0, 20.0, 0.9, "Likely digital stream")
+        self.assertEqual(SignalAnalyzer._choose_mode(candidate), "DIGITAL")
+
+    def test_choose_mode_prefers_wfm_for_wide_signals(self) -> None:
+        candidate = SignalCandidate(0, 0, 99_900_000, 200_000, -40.0, -45.0, 12.0, 0.7, "Wideband activity")
+        self.assertEqual(SignalAnalyzer._choose_mode(candidate), "WFM")
 
 
 if __name__ == "__main__":
