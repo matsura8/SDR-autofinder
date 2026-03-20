@@ -1,6 +1,6 @@
 import unittest
 
-from rf_stream_finder import SignalAnalyzer, SignalCandidate, SignalDetector, SignalHistory, SweepAssembler, SweepParser
+from rf_stream_finder import BandClassifier, SignalAnalyzer, SignalCandidate, SignalDetector, SignalHistory, SweepAssembler, SweepParser
 
 
 class SweepParserTests(unittest.TestCase):
@@ -55,6 +55,14 @@ class SignalHistoryTests(unittest.TestCase):
         self.assertEqual(len(history.entries), 1)
         self.assertEqual(history.entries[0].hit_count, 2)
         self.assertEqual(history.entries[0].last_seen, "2026-03-19 18:00:02.0")
+        self.assertEqual(history.entries[0].band_name, "Unknown")
+
+
+class BandClassifierTests(unittest.TestCase):
+    def test_classifies_fm_broadcast(self) -> None:
+        band_name, source_hint = BandClassifier.classify(99_900_000)
+        self.assertEqual(band_name, "FM Broadcast")
+        self.assertIn("Broadcast FM", source_hint)
 
 
 class SignalAnalyzerTests(unittest.TestCase):
@@ -65,6 +73,13 @@ class SignalAnalyzerTests(unittest.TestCase):
     def test_choose_mode_prefers_wfm_for_wide_signals(self) -> None:
         candidate = SignalCandidate(0, 0, 99_900_000, 200_000, -40.0, -45.0, 12.0, 0.7, "Wideband activity")
         self.assertEqual(SignalAnalyzer._choose_mode(candidate), "WFM")
+
+    def test_iq_analysis_returns_points_and_metrics(self) -> None:
+        iq = [complex(0.1, 0.2), complex(-0.2, 0.1), complex(0.0, -0.3), complex(0.25, 0.05)] * 100
+        analysis = SignalAnalyzer._analyze_iq(iq)
+        self.assertTrue(analysis.scatter_points)
+        self.assertTrue(analysis.waveform_points)
+        self.assertGreater(analysis.peak_magnitude, 0.0)
 
 
 if __name__ == "__main__":

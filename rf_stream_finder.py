@@ -47,6 +47,8 @@ class SignalCandidate:
     snr_db: float
     score: float
     label: str
+    band_name: str = "Unknown"
+    source_hint: str = "Unclassified"
 
 
 @dataclass(slots=True)
@@ -67,8 +69,23 @@ class LoggedSignal:
     bandwidth_hz: float
     peak_db: float
     label: str
+    band_name: str
+    source_hint: str
     score: float
     hit_count: int
+
+
+@dataclass(slots=True)
+class IQAnalysis:
+    dc_i: float
+    dc_q: float
+    avg_magnitude: float
+    peak_magnitude: float
+    magnitude_stddev: float
+    phase_stddev: float
+    iq_correlation: float
+    scatter_points: list[tuple[float, float]]
+    waveform_points: list[float]
 
 
 @dataclass(slots=True)
@@ -80,6 +97,44 @@ class InvestigationResult:
     iq_path: Optional[str]
     summary: str
     recommended_next_step: str
+    iq_analysis: IQAnalysis
+
+
+class BandClassifier:
+    BANDS = [
+        (0.53e6, 1.71e6, "AM Broadcast", "AM radio / medium wave"),
+        (26.965e6, 27.405e6, "CB Radio", "Citizen band or nearby HF users"),
+        (87.5e6, 108e6, "FM Broadcast", "Broadcast FM audio"),
+        (108e6, 137e6, "Airband", "Aviation voice / nav"),
+        (144e6, 148e6, "2m Amateur", "Amateur radio"),
+        (156e6, 162.025e6, "Marine VHF", "Marine voice / AIS adjacent"),
+        (162.4e6, 162.55e6, "NOAA Weather", "Weather radio"),
+        (162.55e6, 174e6, "VHF High", "Land mobile / public service"),
+        (216e6, 225e6, "Military Air", "Military aviation"),
+        (300e6, 380e6, "UHF Military/Gov", "Military or government"),
+        (400e6, 406e6, "Satellite/NOAA", "Meteorological or satellite downlink"),
+        (420e6, 450e6, "70cm Amateur / ISM", "Amateur, ISM, remotes"),
+        (450e6, 470e6, "UHF Land Mobile", "Business / public safety"),
+        (758e6, 806e6, "700 MHz Public Safety", "Public safety / LTE"),
+        (824e6, 849e6, "Cellular Uplink", "Cellular / LTE / legacy"),
+        (869e6, 894e6, "Cellular Downlink", "Cellular / LTE / legacy"),
+        (902e6, 928e6, "915 MHz ISM", "ISM, LoRa, telemetry"),
+        (960e6, 1215e6, "Aero Radionavigation", "DME / ADS-B nearby"),
+        (1090e6, 1090.1e6, "ADS-B", "Aircraft transponder"),
+        (1200e6, 1300e6, "23cm Amateur", "Amateur / amateur TV"),
+        (1574e6, 1577e6, "GNSS L1", "GPS/GNSS"),
+        (1610e6, 1627e6, "Satellite MSS", "L-band satellite"),
+        (2400e6, 2483.5e6, "2.4 GHz ISM", "Wi-Fi, Bluetooth, ISM"),
+        (3300e6, 4200e6, "3.5 GHz / C-band", "5G, fixed links, radar"),
+        (5150e6, 5925e6, "5 GHz ISM/UNII", "Wi-Fi / radar / unlicensed"),
+    ]
+
+    @classmethod
+    def classify(cls, center_hz: float) -> tuple[str, str]:
+        for low, high, band_name, source_hint in cls.BANDS:
+            if low <= center_hz <= high:
+                return band_name, source_hint
+        return "Unknown", "Unclassified"
 
 
 class SweepParser:
@@ -143,6 +198,7 @@ class SignalDetector:
                 + 0.20 * flatness,
             )
             label = self._classify_candidate(bandwidth_hz, prominence, flatness)
+            band_name, source_hint = BandClassifier.classify(center_hz)
             candidates.append(
                 SignalCandidate(
                     start_hz=frequencies_hz[start],
@@ -154,6 +210,8 @@ class SignalDetector:
                     snr_db=prominence,
                     score=score,
                     label=label,
+                    band_name=band_name,
+                    source_hint=source_hint,
                 )
             )
 
@@ -405,6 +463,8 @@ class SignalHistory:
                 existing.peak_db = max(existing.peak_db, candidate.peak_db)
                 existing.score = max(existing.score, candidate.score)
                 existing.label = candidate.label
+                existing.band_name = candidate.band_name
+                existing.source_hint = candidate.source_hint
                 existing.hit_count += 1
                 updated.append(existing)
             else:
@@ -415,6 +475,8 @@ class SignalHistory:
                     bandwidth_hz=candidate.bandwidth_hz,
                     peak_db=candidate.peak_db,
                     label=candidate.label,
+                    band_name=candidate.band_name,
+                    source_hint=candidate.source_hint,
                     score=candidate.score,
                     hit_count=1,
                 )
@@ -444,12 +506,18 @@ class SignalAnalyzer:
             iq_path = self._capture_hardware_iq(candidate, config)
 
         if mode == "DIGITAL":
+            iq_samples, _sample_rate = self._read_iq_file(iq_path)
+            iq_analysis = self._analyze_iq(iq_samples)
             summary = (
                 f"Best-effort classifier marked this signal as digital/unhandled. IQ capture saved for later analysis.\n"
                 f"Center: {candidate.center_hz / 1_000_000:.3f} MHz\n"
                 f"Bandwidth: {candidate.bandwidth_hz / 1_000:.1f} kHz\n"
+                f"Band: {candidate.band_name}\n"
+                f"Likely source: {candidate.source_hint}\n"
                 f"Peak: {candidate.peak_db:.1f} dB\n"
-                f"IQ file: {iq_path}"
+                f"IQ file: {iq_path}\n"
+                f"IQ metrics: DC(I)={iq_analysis.dc_i:+.3f}, DC(Q)={iq_analysis.dc_q:+.3f}, "
+                f"|IQ| avg={iq_analysis.avg_magnitude:.3f}, corr={iq_analysis.iq_correlation:+.3f}"
             )
             return InvestigationResult(
                 center_hz=candidate.center_hz,
@@ -459,9 +527,11 @@ class SignalAnalyzer:
                 iq_path=iq_path,
                 summary=summary,
                 recommended_next_step="Inspect the IQ clip with protocol-specific tools or compare with known digital allocations.",
+                iq_analysis=iq_analysis,
             )
 
         iq_samples, sample_rate = self._read_iq_file(iq_path)
+        iq_analysis = self._analyze_iq(iq_samples)
         audio_samples = self._demodulate(iq_samples, sample_rate, mode)
         audio_path = self._write_wav(audio_samples, 48_000, candidate.center_hz, mode)
         self.last_audio_path = audio_path
@@ -469,9 +539,13 @@ class SignalAnalyzer:
             f"Demodulated {mode} audio preview.\n"
             f"Center: {candidate.center_hz / 1_000_000:.3f} MHz\n"
             f"Bandwidth: {candidate.bandwidth_hz / 1_000:.1f} kHz\n"
+            f"Band: {candidate.band_name}\n"
+            f"Likely source: {candidate.source_hint}\n"
             f"Peak: {candidate.peak_db:.1f} dB\n"
             f"Audio: {audio_path}\n"
-            f"IQ: {iq_path}"
+            f"IQ: {iq_path}\n"
+            f"IQ metrics: DC(I)={iq_analysis.dc_i:+.3f}, DC(Q)={iq_analysis.dc_q:+.3f}, "
+            f"|IQ| avg={iq_analysis.avg_magnitude:.3f}, phase std={iq_analysis.phase_stddev:.3f}"
         )
         return InvestigationResult(
             center_hz=candidate.center_hz,
@@ -481,6 +555,7 @@ class SignalAnalyzer:
             iq_path=iq_path,
             summary=summary,
             recommended_next_step="Listen for intelligible content, then refine bandwidth/gain or move to protocol-specific decoding if needed.",
+            iq_analysis=iq_analysis,
         )
 
     def play_audio(self, path: Optional[str]) -> bool:
@@ -565,6 +640,34 @@ class SignalAnalyzer:
         for idx in range(0, len(raw) - 1, 2):
             iq_samples.append(complex(raw[idx] / 128.0, raw[idx + 1] / 128.0))
         return iq_samples, sample_rate
+
+    @staticmethod
+    def _analyze_iq(iq_samples: list[complex]) -> IQAnalysis:
+        if not iq_samples:
+            return IQAnalysis(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, [], [])
+        i_values = [sample.real for sample in iq_samples]
+        q_values = [sample.imag for sample in iq_samples]
+        magnitudes = [abs(sample) for sample in iq_samples]
+        phases = [math.atan2(sample.imag, sample.real) for sample in iq_samples if sample.real or sample.imag]
+        dc_i = statistics.fmean(i_values)
+        dc_q = statistics.fmean(q_values)
+        avg_mag = statistics.fmean(magnitudes)
+        peak_mag = max(magnitudes)
+        mag_std = statistics.pstdev(magnitudes) if len(magnitudes) > 1 else 0.0
+        phase_std = statistics.pstdev(phases) if len(phases) > 1 else 0.0
+        if len(i_values) > 1 and len(q_values) > 1:
+            i_mean = statistics.fmean(i_values)
+            q_mean = statistics.fmean(q_values)
+            covariance = statistics.fmean((i - i_mean) * (q - q_mean) for i, q in zip(i_values, q_values))
+            denom = (statistics.pstdev(i_values) or 1.0) * (statistics.pstdev(q_values) or 1.0)
+            corr = covariance / denom if denom else 0.0
+        else:
+            corr = 0.0
+        step = max(1, len(iq_samples) // 1500)
+        scatter = [(iq_samples[idx].real, iq_samples[idx].imag) for idx in range(0, len(iq_samples), step)][:1500]
+        wave_step = max(1, len(magnitudes) // 500)
+        waveform = [magnitudes[idx] for idx in range(0, len(magnitudes), wave_step)][:500]
+        return IQAnalysis(dc_i, dc_q, avg_mag, peak_mag, mag_std, phase_std, corr, scatter, waveform)
 
     def _demodulate(self, iq_samples: list[complex], sample_rate: int, mode: str) -> list[int]:
         if mode in {"WFM", "NFM"}:
@@ -729,6 +832,55 @@ class SpectrumCanvas(tk.Canvas):
         return f"{hz:.0f} Hz"
 
 
+class IQCanvas(tk.Canvas):
+    def __init__(self, master: tk.Misc, **kwargs) -> None:
+        super().__init__(master, background="#07111b", highlightthickness=0, **kwargs)
+        self.analysis: Optional[IQAnalysis] = None
+        self.bind("<Configure>", lambda _event: self.redraw())
+
+    def set_analysis(self, analysis: Optional[IQAnalysis]) -> None:
+        self.analysis = analysis
+        self.redraw()
+
+    def redraw(self) -> None:
+        self.delete("all")
+        width = max(220, self.winfo_width())
+        height = max(220, self.winfo_height())
+        if not self.analysis:
+            self.create_text(width / 2, height / 2, text="IQ analyzer will appear after a stream capture.", fill="#6b8aa7", font=("Segoe UI", 13, "bold"))
+            return
+
+        top_h = int(height * 0.62)
+        left_pad = 24
+        right_pad = 24
+        bottom_pad = 22
+        mid_x = width / 2
+        mid_y = top_h / 2
+        radius = min((width - left_pad - right_pad) / 2, (top_h - 30) / 2) - 10
+
+        self.create_text(16, 10, anchor="nw", text="Constellation / IQ Scatter", fill="#d9edf7", font=("Segoe UI", 10, "bold"))
+        self.create_oval(mid_x - radius, mid_y - radius, mid_x + radius, mid_y + radius, outline="#31516a")
+        self.create_line(mid_x - radius, mid_y, mid_x + radius, mid_y, fill="#173247")
+        self.create_line(mid_x, mid_y - radius, mid_x, mid_y + radius, fill="#173247")
+        for i_value, q_value in self.analysis.scatter_points:
+            x = mid_x + i_value * radius * 0.95
+            y = mid_y - q_value * radius * 0.95
+            self.create_oval(x - 1, y - 1, x + 1, y + 1, outline="", fill="#2dd4bf")
+
+        wave_top = top_h + 28
+        wave_bottom = height - bottom_pad
+        self.create_text(16, top_h + 6, anchor="nw", text="Magnitude Envelope", fill="#d9edf7", font=("Segoe UI", 10, "bold"))
+        self.create_rectangle(left_pad, wave_top, width - right_pad, wave_bottom, outline="#31516a")
+        if self.analysis.waveform_points:
+            peak = max(self.analysis.waveform_points) or 1.0
+            points: list[float] = []
+            for idx, value in enumerate(self.analysis.waveform_points):
+                x = left_pad + idx / max(1, len(self.analysis.waveform_points) - 1) * (width - left_pad - right_pad)
+                y = wave_bottom - (value / peak) * (wave_bottom - wave_top)
+                points.extend((x, y))
+            self.create_line(points, fill="#ffd166", width=2)
+
+
 class RFStreamFinderApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -745,9 +897,9 @@ class RFStreamFinderApp:
         self.last_analysis: Optional[InvestigationResult] = None
 
         self.source_mode = tk.StringVar(value="simulation")
-        self.start_mhz_var = tk.StringVar(value="430")
-        self.stop_mhz_var = tk.StringVar(value="930")
-        self.bin_width_var = tk.StringVar(value="100000")
+        self.start_mhz_var = tk.StringVar(value="1")
+        self.stop_mhz_var = tk.StringVar(value="6000")
+        self.bin_width_var = tk.StringVar(value="5000000")
         self.lna_var = tk.StringVar(value="24")
         self.vga_var = tk.StringVar(value="20")
         self.amp_var = tk.BooleanVar(value=False)
@@ -825,8 +977,8 @@ class RFStreamFinderApp:
         self._add_status_row(status_frame, 4, "Analysis", self.analysis_var)
 
         ttk.Label(sidebar, text="Detected Streams", style="Header.TLabel").grid(row=2, column=0, sticky="nw")
-        self.candidate_tree = ttk.Treeview(sidebar, columns=("center", "bandwidth", "peak", "score"), show="headings", height=10)
-        for name, label, width in (("center", "Center", 110), ("bandwidth", "Bandwidth", 90), ("peak", "Peak", 70), ("score", "Confidence", 80)):
+        self.candidate_tree = ttk.Treeview(sidebar, columns=("center", "bandwidth", "band", "peak", "score"), show="headings", height=10)
+        for name, label, width in (("center", "Center", 100), ("bandwidth", "Bandwidth", 90), ("band", "Band", 120), ("peak", "Peak", 70), ("score", "Confidence", 80)):
             self.candidate_tree.heading(name, text=label)
             self.candidate_tree.column(name, width=width, anchor="center")
         self.candidate_tree.grid(row=3, column=0, sticky="nsew", pady=(8, 14))
@@ -852,13 +1004,15 @@ class RFStreamFinderApp:
         history_tab.rowconfigure(1, weight=1)
         history_tab.columnconfigure(0, weight=1)
         ttk.Label(history_tab, text="Persistent Signal Log", style="Header.TLabel").grid(row=0, column=0, sticky="w")
-        self.history_tree = ttk.Treeview(history_tab, columns=("first", "last", "center", "hits", "label", "peak"), show="headings", height=8)
+        self.history_tree = ttk.Treeview(history_tab, columns=("first", "last", "center", "band", "source", "hits", "label", "peak"), show="headings", height=8)
         for name, label, width in (
             ("first", "First Seen", 150),
             ("last", "Last Seen", 150),
-            ("center", "Center", 120),
+            ("center", "Center", 100),
+            ("band", "Band", 130),
+            ("source", "Likely Source", 180),
             ("hits", "Hits", 60),
-            ("label", "Type", 180),
+            ("label", "Type", 150),
             ("peak", "Peak", 80),
         ):
             self.history_tree.heading(name, text=label)
@@ -866,11 +1020,14 @@ class RFStreamFinderApp:
         self.history_tree.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
 
         investigation_tab.rowconfigure(1, weight=1)
+        investigation_tab.rowconfigure(2, weight=2)
         investigation_tab.columnconfigure(0, weight=1)
         ttk.Label(investigation_tab, text="Stream Investigation", style="Header.TLabel").grid(row=0, column=0, sticky="w")
         self.investigation_text = tk.Text(investigation_tab, height=12, background="#081520", foreground="#e3f2fd", insertbackground="#e3f2fd", relief="flat", wrap="word", font=("Consolas", 10))
-        self.investigation_text.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        self.investigation_text.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
         self.investigation_text.configure(state="disabled")
+        self.iq_canvas = IQCanvas(investigation_tab)
+        self.iq_canvas.grid(row=2, column=0, sticky="nsew")
 
         log_tab.rowconfigure(1, weight=1)
         log_tab.columnconfigure(0, weight=1)
@@ -967,7 +1124,7 @@ class RFStreamFinderApp:
                 newest = updated_entries[0]
                 self._log(
                     f"Logged signal {newest.center_hz / 1_000_000:.3f} MHz"
-                    f" ({newest.label}, {newest.peak_db:.1f} dB)."
+                    f" ({newest.label}, {newest.band_name}, {newest.peak_db:.1f} dB)."
                 )
 
     def _handle_status(self, status: str) -> None:
@@ -983,6 +1140,7 @@ class RFStreamFinderApp:
             self.investigation_text,
             result.summary + "\n\nRecommended next step:\n" + result.recommended_next_step,
         )
+        self.iq_canvas.set_analysis(result.iq_analysis)
         if result.audio_path:
             played = self.analyzer.play_audio(result.audio_path)
             self._log(
@@ -1005,6 +1163,7 @@ class RFStreamFinderApp:
                 values=(
                     f"{candidate.center_hz / 1_000_000:.3f} MHz",
                     self._human_bandwidth(candidate.bandwidth_hz),
+                    candidate.band_name,
                     f"{candidate.peak_db:.1f} dB",
                     f"{candidate.score * 100:.0f}%",
                 ),
@@ -1022,6 +1181,8 @@ class RFStreamFinderApp:
                     entry.first_seen,
                     entry.last_seen,
                     f"{entry.center_hz / 1_000_000:.3f} MHz",
+                    entry.band_name,
+                    entry.source_hint,
                     entry.hit_count,
                     entry.label,
                     f"{entry.peak_db:.1f} dB",

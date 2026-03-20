@@ -6,9 +6,10 @@ Desktop spectrum scanner for HackRF that watches sweep output in real time, flag
 
 - Launches `hackrf_sweep` and parses live CSV sweep rows from the official HackRF sweep format.
 - Scores contiguous above-noise regions to identify likely digital streams, narrowband carriers, and other notable activity.
+- Tags detections with likely signal bands and source categories based on center frequency.
 - Draws a live spectrum view with highlighted candidate regions and a side panel listing center frequency, bandwidth, peak level, and confidence.
 - Maintains a persistent "found signals" log so repeated hits stay visible for later investigation.
-- Adds per-stream investigation that captures a short IQ clip around a selected signal, generates best-effort AM/FM audio output when appropriate, and stores the IQ/audio files on disk.
+- Adds per-stream investigation that captures a short IQ clip around a selected signal, runs an IQ analyzer view, generates best-effort AM/FM audio output when appropriate, and stores the IQ/audio files on disk.
 - Includes a simulation mode so the GUI can be tested without a HackRF attached.
 
 ## Requirements
@@ -24,6 +25,7 @@ python rf_stream_finder.py
 ```
 
 Use `simulation` mode to preview the app on a machine without `hackrf_sweep`. Switch to `hardware` mode when the HackRF tools are installed and the radio is connected.
+The default scan range opens to the full HackRF span (`1 MHz` through `6000 MHz`) with a coarse `5 MHz` bin width so the whole band is visible immediately.
 
 ## Testing
 
